@@ -131,22 +131,19 @@ public:
         }
 
         Y.set(out_index);
-        softmaxblock->set_first_delta_and_propagate_with_cross_enthropy(Y.get(), lstmblock3->get_delta_output(str.size()-1), str.size()-1);
-        double error=softmaxblock->get_delta_output(str.size()-1).sum_of_squares();
-        lstmblock3->propagate_delta(lstmblock2->get_delta_output(str.size()-1), str.size()-1, str.size());
-        lstmblock2->propagate_delta(lstmblock1->get_delta_output(str.size()-1), str.size()-1, str.size());
-        lstmblock1->propagate_delta(perceptronblock->get_delta_output(str.size()-1), str.size()-1, str.size());
-        perceptronblock->propagate_delta(str.size()-1);
-        for(size_t i=str.size()-2;;)
+        double error=0.0;
+        for(size_t i=str.size()-1;;)
         {
             //Set up output
-            lstmblock3->get_delta_output(i).set(0.0);
+            softmaxblock->set_first_delta_and_propagate_with_cross_enthropy(Y.get(), lstmblock3->get_delta_output(i), i);
+            error+=softmaxblock->get_delta_output(i).sum_of_squares();
             lstmblock3->propagate_delta(lstmblock2->get_delta_output(i), i, str.size());
             lstmblock2->propagate_delta(lstmblock1->get_delta_output(i), i, str.size());
             lstmblock1->propagate_delta(perceptronblock->get_delta_output(i), i, str.size());
             perceptronblock->propagate_delta(i);
             if(i--==0)break;
         }
+        error/=str.size();
 
         for(size_t i=0;i<str.size();i++)
         {
@@ -161,6 +158,31 @@ public:
         }
 
         return error;
+    }
+
+    inline double testing_iteration(const string &str, const size_t out_index)
+    {
+        perceptronblock->set_time_steps(str.size());
+        lstmblock1->set_time_steps(str.size());
+        lstmblock2->set_time_steps(str.size());
+        lstmblock3->set_time_steps(str.size());
+        softmaxblock->set_time_steps(str.size());
+        Y.set(out_index);
+        double error=0.0;
+        for(size_t i=0;i<str.size();i++)
+        {
+            X.set(char_to_index.at(str[i]));
+
+            perceptronblock->calc(X.get(), i);
+            lstmblock1->calc(perceptronblock->get_output(i), i);
+            lstmblock2->calc(lstmblock1->get_output(i), i);
+            lstmblock3->calc(lstmblock2->get_output(i), i);
+            softmaxblock->calc(lstmblock3->get_output(i), i);
+
+            softmaxblock->set_first_delta(Y.get(), i);
+            error+=softmaxblock->get_delta_output(i).sum_of_squares();
+        }
+        return error/str.size();
     }
 
     inline void update(const double learning_rate)
@@ -218,9 +240,10 @@ int main()
     static const char *testingfilepath="../songs/testing/%s";
     static const char *trainingfilepath="../songs/training/%s";
     static const char *savecounter_filename="data/savecounter.svc";
+    static const char *savecounter_history_filename="data/savecounter_history.txt";
     static const char *savestate_filename="data/savestate%08lu.sst";
     static const char *wb_filename="data/wb.wab";
-    static constexpr time_t secons_between_saves=1*60*60;
+    static constexpr time_t secons_between_saves=2*60*60;
 
     static constexpr size_t allowed_char_amount=54;
     static const string index_to_char="abcdefghijklmnopqrstuvwxyz0123456789 \n\"`'$()/?[].:,;!-";
@@ -231,7 +254,7 @@ int main()
     std::mt19937 gen(rd());
     uniform_int_distribution<size_t> song_dst(0,num_songs-1);
     MyClass<allowed_char_amount,200,100,50,num_songs> myclass(index_to_char,char_to_index);
-    myclass.reserve_time_steps(8000);
+    myclass.reserve_time_steps(20000);
 
     array<vector<string>, num_songs> training_songs;
     array<vector<string>, num_songs> testing_songs;
@@ -251,17 +274,31 @@ int main()
         testing_dst[i]=uniform_int_distribution<size_t>(0,testing_songs[i].size()-1);
     }
 
+    // size_t max_size=0;
+    // for(const auto &a:training_songs)
+    //     for(const auto &b:a)
+    //         if(b.size()>max_size) max_size=b.size();
+    // print(max_size);
+    // max_size=0;
+    // for(const auto &a:testing_songs)
+    //     for(const auto &b:a)
+    //         if(b.size()>max_size) max_size=b.size();
+    // print(max_size);
+
     double error=0.0;
     size_t save_counter=0;
     size_t iteration=0;
-    double learning_rate=0.01;
-    double momentum=0.5;
-    static constexpr size_t batch_size=1;
+    static constexpr double initial_learning_rate=0.001;
+    static constexpr double initial_momentum=0.5;
+    double learning_rate=initial_learning_rate;
+    double momentum=initial_momentum;
+    static constexpr size_t batch_size=2;
     {
         ifstream in(savecounter_filename, std::ios::binary);
         if(in.good())
         {
-            in >> save_counter >> iteration >> error >> learning_rate >> momentum;
+            double dummy_testing_error;
+            in >> save_counter >> iteration >> error >> learning_rate >> momentum >> dummy_testing_error;
             assert(not in.fail());
             assert(save_counter!=0);
             {
@@ -279,14 +316,15 @@ int main()
     time_t last_time=time(nullptr);
     for(;;iteration++)
     {
-        if(iteration%1000==0)
+        if(iteration%10==0)
         {
-            learning_rate=0.01*pow(0.9549925860214360, (iteration/1000));// gets divided by 10 every 50k steps
-            if(iteration<=50000) momentum=0.5+0.008*(iteration/1000);
-            else if(iteration<=100000)momentum=0.9+0.0018*((iteration-50000)/1000);
-            // else if(iteration<=150000)momentum=0.99+0.00018*((iteration-100000)/1000);
-            // else if(iteration<=200000)momentum=0.999+0.000018*((iteration-150000)/1000);
-            else momentum=.99;
+            learning_rate=initial_learning_rate*pow(0.9772372209558107, (iteration/1000.));// gets divided by 10 every 100k steps
+            momentum=1.0-learning_rate*(1.0/initial_learning_rate)*(1.0-initial_momentum);
+            // if(iteration<=50000) momentum=0.5+0.008*(iteration/1000);
+            // else if(iteration<=100000)momentum=0.9+0.0018*((iteration-50000)/1000);
+            // // else if(iteration<=150000)momentum=0.99+0.00018*((iteration-100000)/1000);
+            // // else if(iteration<=200000)momentum=0.999+0.000018*((iteration-150000)/1000);
+            // else momentum=.99;
         }
         myclass.apply_momentum(momentum);
         error*=0.999;
@@ -301,6 +339,21 @@ int main()
         if(time(nullptr)-last_time>secons_between_saves)
         {
             last_time=time(nullptr);
+            print("Calculating test error...");
+            double testing_error=0.0;
+            {
+                size_t num_tests=0;
+                for(size_t i=0;i<num_songs;i++)
+                {
+                    for(const auto &song:testing_songs[i])
+                    {
+                        num_tests++;
+                        testing_error+=myclass.testing_iteration(song, i);
+                    }
+                }
+                testing_error/=num_tests;
+            }
+            print("Testing Error:", testing_error);
             print("Saving current state...");
             save_counter++;
             myclass.only_wb_to_bin_file(wb_filename);
@@ -311,11 +364,16 @@ int main()
             {
                 ofstream out(savecounter_filename,std::ios_base::trunc);
                 assert(out.good());
-                out << save_counter << "\t" << iteration << "\t" << error << "\t" << learning_rate << "\t" << momentum <<endl;
+                out << save_counter << "\t" << iteration << "\t" << error << "\t" << learning_rate << "\t" << momentum << "\t" << testing_error << endl;
+            }
+            {
+                ofstream out(savecounter_history_filename,std::fstream::app);
+                assert(out.good());
+                out << save_counter << "\t" << iteration << "\t" << error << "\t" << learning_rate << "\t" << momentum << "\t" << testing_error << endl;
             }
             print("State with number", save_counter, "saved");
         }
-        print("Iteration:", iteration, "Error:", error);
+        print("Iteration:", iteration, "Error:", error, "Learning Rate:", learning_rate, "Momentum:", momentum);
     }
 
     return 0;
